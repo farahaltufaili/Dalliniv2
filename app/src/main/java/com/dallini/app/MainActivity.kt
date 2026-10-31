@@ -87,6 +87,7 @@ class MainActivity : AppCompatActivity(), LocationListener, TextToSpeech.OnInitL
     private var searchRequest = 0
     private var routeRequest = 0
     private var signRequest = 0
+    private var placeDetailsRequest = 0
     private var currentLimit: Int? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -144,8 +145,8 @@ class MainActivity : AppCompatActivity(), LocationListener, TextToSpeech.OnInitL
         }
         applyMapTheme()
         map.overlays.add(MapEventsOverlay(object : MapEventsReceiver {
-            override fun singleTapConfirmedHelper(p: GeoPoint): Boolean { selectPlace(Place("الموقع المحدد", p.latitude, p.longitude)); return true }
-            override fun longPressHelper(p: GeoPoint): Boolean { selectPlace(Place("الموقع المحدد", p.latitude, p.longitude)); return true }
+            override fun singleTapConfirmedHelper(p: GeoPoint): Boolean { selectMapPoint(p); return true }
+            override fun longPressHelper(p: GeoPoint): Boolean { selectMapPoint(p); return true }
         }))
         root.addView(map, FrameLayout.LayoutParams(-1, -1))
         val ui = FrameLayout(this)
@@ -367,7 +368,49 @@ class MainActivity : AppCompatActivity(), LocationListener, TextToSpeech.OnInitL
             } catch (_: Exception) { toast("تعذر البحث. تحققي من الإنترنت") }
         }.start()
     }
+    /** Restore v2 place lookup: tapped map coordinates resolve to a name/address. */
+    private fun selectMapPoint(point: GeoPoint) {
+        val fallback = Place("جاري جلب تفاصيل المكان…", point.latitude, point.longitude)
+        selectPlace(fallback)
+        val request = ++placeDetailsRequest
+        Thread {
+            try {
+                val url = "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=ar" +
+                    "&lat=${point.latitude}&lon=${point.longitude}"
+                val data = JSONObject(httpGet(url))
+                val address = data.optString("display_name")
+                val displayName = data.optString("name").ifBlank { address.substringBefore(",").trim() }
+                    .ifBlank { "الموقع المحدد" }
+                runOnUiThread {
+                    if (request != placeDetailsRequest || isFinishing || isDestroyed) return@runOnUiThread
+                    val current = selected ?: return@runOnUiThread
+                    if (current.lat != point.latitude || current.lon != point.longitude) return@runOnUiThread
+                    val place = Place(displayName, point.latitude, point.longitude, address)
+                    selected = place
+                    cardTitle.text = place.name
+                    cardBody.text = place.address.ifBlank { formatCoordinates(point) }
+                    destinationMarker?.title = place.name
+                    addRecent(place)
+                }
+            } catch (_: Exception) {
+                runOnUiThread {
+                    if (request != placeDetailsRequest) return@runOnUiThread
+                    val current = selected ?: return@runOnUiThread
+                    if (current.lat != point.latitude || current.lon != point.longitude) return@runOnUiThread
+                    val place = Place("الموقع المحدد", point.latitude, point.longitude)
+                    selected = place
+                    cardTitle.text = place.name
+                    cardBody.text = formatCoordinates(point) + "\nتعذر جلب العنوان، يمكن حفظ الموقع أو عرض المسار"
+                }
+            }
+        }.start()
+    }
+
+    private fun formatCoordinates(p: GeoPoint): String =
+        String.format(Locale.US, "%.5f, %.5f", p.latitude, p.longitude)
+
     private fun selectPlace(place: Place) {
+        ++placeDetailsRequest
         if (navigating) stopNavigation()
         selected = place; route = null; ++routeRequest
         addRecent(place)
@@ -388,6 +431,7 @@ class MainActivity : AppCompatActivity(), LocationListener, TextToSpeech.OnInitL
         map.invalidate()
     }
     private fun closeCard() {
+        ++placeDetailsRequest
         if (navigating) stopNavigation()
         card.visibility = View.GONE
         destinationMarker?.let { map.overlays.remove(it) }; destinationMarker = null
@@ -612,7 +656,7 @@ class MainActivity : AppCompatActivity(), LocationListener, TextToSpeech.OnInitL
     override fun onResume() { super.onResume(); map.onResume() }
     override fun onPause() { map.onPause(); super.onPause() }
     override fun onDestroy() {
-        ++searchRequest; ++routeRequest; ++signRequest
+        ++searchRequest; ++routeRequest; ++signRequest; ++placeDetailsRequest
         handler.removeCallbacksAndMessages(null)
         try { (getSystemService(LOCATION_SERVICE) as LocationManager).removeUpdates(this) } catch (_: Exception) {}
         tts?.stop(); tts?.shutdown(); map.onDetach()
