@@ -423,6 +423,7 @@ class MainActivity : AppCompatActivity(), LocationListener {
         val m = Marker(map)
         m.position = p
         m.title = title
+        m.icon = ContextCompat.getDrawable(this, R.drawable.ic_pin)
         m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
         m.setInfoWindow(null)
         m.setOnMarkerClickListener { _, _ -> true }
