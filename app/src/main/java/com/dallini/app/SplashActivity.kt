@@ -12,72 +12,81 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 
+/** Short welcome screen. Change SPLASH_DURATION_MS to adjust the delay. */
 class SplashActivity : AppCompatActivity() {
+    companion object {
+        private const val SPLASH_DURATION_MS = 1800L
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val openApp = Runnable {
+        if (!isFinishing && !isDestroyed) {
+            startActivity(Intent(this, MainActivity::class.java))
+            finish()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val d = resources.displayMetrics.density
+        val navy = Color.parseColor("#14243D")
+        window.statusBarColor = navy
+        window.navigationBarColor = navy
 
         val root = FrameLayout(this)
-        root.setBackgroundColor(Color.parseColor("#1B2A41"))
+        root.setBackgroundColor(navy)
 
-        val center = LinearLayout(this)
-        center.orientation = LinearLayout.VERTICAL
-        center.gravity = Gravity.CENTER
-
-        val logo = ImageView(this)
-        logo.setImageResource(R.drawable.ic_logo)
-        center.addView(logo, LinearLayout.LayoutParams((140 * d).toInt(), (140 * d).toInt()))
-
-        val title = TextView(this)
-        title.text = "دليني"
-        title.setTextColor(Color.WHITE)
-        title.textSize = 40f
-        title.typeface = Typeface.DEFAULT_BOLD
-        title.gravity = Gravity.CENTER
-        val tlp = LinearLayout.LayoutParams(-2, -2)
-        tlp.topMargin = (12 * d).toInt()
-        center.addView(title, tlp)
-
-        val sub = TextView(this)
-        sub.text = "رفيقك على الطريق"
-        sub.setTextColor(Color.parseColor("#9CC9F5"))
-        sub.textSize = 16f
-        sub.gravity = Gravity.CENTER
-        val slp = LinearLayout.LayoutParams(-2, -2)
-        slp.topMargin = (4 * d).toInt()
-        center.addView(sub, slp)
-
-        root.addView(center, FrameLayout.LayoutParams(-1, -1))
-
-        val credit = TextView(this)
-        credit.text = "تم تطوير التطبيق بواسطة\nكرار الطفيلي"
-        credit.setTextColor(Color.parseColor("#9FB3C8"))
-        credit.textSize = 13f
-        credit.gravity = Gravity.CENTER
-        val clp = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
-        clp.bottomMargin = (64 * d).toInt()
-        root.addView(credit, clp)
-
-        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
-            val b = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(0, b.top, 0, b.bottom)
-            insets
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(24), dp(24), dp(24))
         }
 
+        val logo = ImageView(this).apply {
+            setImageResource(R.drawable.ic_logo)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = "شعار دلّيني"
+        }
+        content.addView(logo, LinearLayout.LayoutParams(dp(104), dp(104)))
+
+        val name = TextView(this).apply {
+            text = "دلّيني"
+            textSize = 34f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        val nameParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(18) }
+        content.addView(name, nameParams)
+
+        val tagline = TextView(this).apply {
+            text = "دليلك على الطريق"
+            textSize = 16f
+            setTextColor(Color.parseColor("#C2DFE7"))
+            gravity = Gravity.CENTER
+        }
+        content.addView(tagline, LinearLayout.LayoutParams(-2, -2))
+
+        val cp = FrameLayout.LayoutParams(-1, -2, Gravity.CENTER)
+        root.addView(content, cp)
+
+        val credit = TextView(this).apply {
+            text = "تم تطوير التطبيق بواسطة كرار الطفيلي"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+        }
+        val creditParams = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        creditParams.setMargins(dp(16), 0, dp(16), dp(40))
+        root.addView(credit, creditParams)
         setContentView(root)
-
-        center.alpha = 0f
-        credit.alpha = 0f
-        center.animate().alpha(1f).setDuration(600).start()
-        credit.animate().alpha(1f).setStartDelay(300).setDuration(600).start()
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
-        }, 1800)
+        handler.postDelayed(openApp, SPLASH_DURATION_MS)
     }
+
+    override fun onDestroy() {
+        handler.removeCallbacks(openApp)
+        super.onDestroy()
+    }
+
+    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }
