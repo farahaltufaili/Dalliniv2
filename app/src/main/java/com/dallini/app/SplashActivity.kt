@@ -11,6 +11,8 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.appcompat.app.AppCompatActivity
 
 /** Short welcome screen. Change SPLASH_DURATION_MS to adjust the delay. */
@@ -77,8 +79,18 @@ class SplashActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
         }
         val creditParams = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
-        creditParams.setMargins(dp(16), 0, dp(16), dp(40))
+        creditParams.setMargins(dp(16), 0, dp(16), dp(64))
         root.addView(credit, creditParams)
+
+        // Keep the developer credit above the phone's navigation controls.
+        // Insets vary between gesture navigation and the three-button bar.
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val navInset = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+            creditParams.bottomMargin = maxOf(dp(64), navInset + dp(28))
+            credit.layoutParams = creditParams
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
         setContentView(root)
         handler.postDelayed(openApp, SPLASH_DURATION_MS)
     }
