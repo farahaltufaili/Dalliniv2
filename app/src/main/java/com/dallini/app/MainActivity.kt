@@ -4,24 +4,22 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Color
-import android.graphics.Typeface
+import android.content.res.Configuration as AndroidConfiguration
+import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Bundle
-import android.text.InputType
+import android.os.Handler
+import android.os.Looper
+import android.speech.tts.TextToSpeech
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
-import android.widget.EditText
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -34,51 +32,95 @@ import org.json.JSONObject
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
-import kotlin.math.roundToInt
+import kotlin.math.*
 
-class MainActivity : AppCompatActivity(), LocationListener {
-
-    private lateinit var map: MapView
-    private lateinit var speedView: TextView
-    private lateinit var searchBox: EditText
-    private lateinit var fab: TextView
-    private lateinit var card: LinearLayout
-    private lateinit var titleView: TextView
-    private lateinit var bodyView: TextView
-
-    private var meMarker: Marker? = null
-    private var selMarker: Marker? = null
-    private val signMarkers = mutableListOf<Marker>()
-    private var lastQuery: Location? = null
-    private var lastLoc: Location? = null
-    private var firstFix = true
-    private var follow = true
-    private var started = false
-    private var reqId = 0
-
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
-    private fun roundBg(color: Int, radiusDp: Int): GradientDrawable {
-        val g = GradientDrawable()
-        g.shape = GradientDrawable.RECTANGLE
-        g.setColor(color)
-        g.cornerRadius = dp(radiusDp).toFloat()
-        return g
+/** Dallini v3: experimental foreground navigation. Requires network for routing/search. */
+class MainActivity : AppCompatActivity(), LocationListener, TextToSpeech.OnInitListener {
+    private val dark by lazy {
+        when (prefs.getString("theme", "auto")) {
+            "dark" -> true
+            "light" -> false
+            else -> (resources.configuration.uiMode and AndroidConfiguration.UI_MODE_NIGHT_MASK) == AndroidConfiguration.UI_MODE_NIGHT_YES
+        }
     }
+    private val prefs by lazy { getSharedPreferences("dallini_v3", MODE_PRIVATE) }
+    private val teal = Color.rgb(6, 132, 128)
+    private val navy = Color.rgb(20, 36, 61)
+    private val white get() = if (dark) Color.rgb(32, 45, 57) else Color.WHITE
+    private val ink get() = if (dark) Color.WHITE else navy
+    private val muted get() = if (dark) Color.rgb(185, 201, 209) else Color.rgb(90, 104, 117)
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var map: MapView
+    private lateinit var searchBox: EditText
+    private lateinit var speedView: TextView
+    private lateinit var limitView: TextView
+    private lateinit var card: LinearLayout
+    private lateinit var cardTitle: TextView
+    private lateinit var cardBody: TextView
+    private lateinit var routeButton: TextView
+    private lateinit var starButton: TextView
+    private lateinit var navBanner: TextView
+    private lateinit var locationButton: TextView
+    private lateinit var themeButton: TextView
+    private var meMarker: Marker? = null
+    private var destinationMarker: Marker? = null
+    private val signMarkers = mutableListOf<Marker>()
+    private var routeOverlay: Polyline? = null
+    private var lastLocation: Location? = null
+    private var lastSignsAt: Location? = null
+    private var route: Route? = null
+    private var selected: Place? = null
+    private var navigating = false
+    private var following = true
+    private var firstFix = true
+    private var requestingLocation = false
+    private var searchRequest = 0
+    private var routeRequest = 0
+    private var signRequest = 0
+    private var currentLimit: Int? = null
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var spokenStep = -1
+    private var lastReroute = 0L
+    private var lastSpeedWarning = 0L
+    private var nextVoiceStep = 0
 
-    private fun ovalBg(color: Int): GradientDrawable {
-        val g = GradientDrawable()
-        g.shape = GradientDrawable.OVAL
-        g.setColor(color)
-        return g
+    private data class Place(val name: String, val lat: Double, val lon: Double, val address: String = "") {
+        fun point() = GeoPoint(lat, lon)
+        fun toJson() = JSONObject().put("name", name).put("lat", lat).put("lon", lon).put("address", address)
+        companion object {
+            fun fromJson(o: JSONObject) = Place(o.optString("name", "مكان"), o.getDouble("lat"), o.getDouble("lon"), o.optString("address"))
+        }
+    }
+    private data class Turn(val point: GeoPoint, val instruction: String, val distance: Double)
+    private data class Route(val points: List<GeoPoint>, val turns: List<Turn>, val meters: Double, val seconds: Double)
+    private fun dp(n: Int) = (n * resources.displayMetrics.density).roundToInt()
+    private fun bg(c: Int = white, r: Int = 22) = GradientDrawable().apply { setColor(c); cornerRadius = dp(r).toFloat() }
+    private fun text(s: String, size: Float = 15f, bold: Boolean = false, color: Int = ink): TextView = TextView(this).apply {
+        this.text = s; textSize = size; setTextColor(color); gravity = Gravity.CENTER_VERTICAL
+        if (bold) typeface = Typeface.DEFAULT_BOLD
+    }
+    private fun tappable(s: String, action: () -> Unit): TextView = text(s, 15f, true, Color.WHITE).apply {
+        gravity = Gravity.CENTER; background = bg(teal, 16); setPadding(dp(16), dp(11), dp(16), dp(11))
+        setOnClickListener { action() }
+    }
+    private fun iconButton(s: String, action: () -> Unit): TextView = text(s, 22f, true).apply {
+        gravity = Gravity.CENTER; background = bg(white, 18); elevation = dp(4).toFloat()
+        contentDescription = s; setOnClickListener { action() }
+    }
+    private fun hideKeyboard() {
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(searchBox.windowToken, 0)
+        searchBox.clearFocus()
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -86,482 +128,494 @@ class MainActivity : AppCompatActivity(), LocationListener {
         super.onCreate(savedInstanceState)
         Configuration.getInstance().load(this, getSharedPreferences("osm", Context.MODE_PRIVATE))
         Configuration.getInstance().userAgentValue = packageName
-
+        tts = TextToSpeech(this, this)
+        window.statusBarColor = if (dark) Color.rgb(18, 27, 37) else navy
+        window.navigationBarColor = if (dark) Color.rgb(18, 27, 37) else Color.WHITE
         val root = FrameLayout(this)
-
-        // ---------- الخريطة ----------
-        map = MapView(this)
-        map.setTileSource(TileSourceFactory.MAPNIK)
-        map.setMultiTouchControls(true)
-        map.controller.setZoom(17.0)
-        map.controller.setCenter(GeoPoint(32.0, 44.33))
-        map.setOnTouchListener { _, ev ->
-            if (ev.action == MotionEvent.ACTION_MOVE) follow = false
-            false
-        }
-        val receiver = object : MapEventsReceiver {
-            override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
-                selectPoint(p, null)
-                return true
+        map = MapView(this).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            controller.setZoom(16.0)
+            controller.setCenter(GeoPoint(32.0, 44.33))
+            setOnTouchListener { _, event ->
+                if (event.action == MotionEvent.ACTION_MOVE) following = false
+                false
             }
-            override fun longPressHelper(p: GeoPoint): Boolean = false
         }
-        map.overlays.add(0, MapEventsOverlay(receiver))
+        applyMapTheme()
+        map.overlays.add(MapEventsOverlay(object : MapEventsReceiver {
+            override fun singleTapConfirmedHelper(p: GeoPoint): Boolean { selectPlace(Place("الموقع المحدد", p.latitude, p.longitude)); return true }
+            override fun longPressHelper(p: GeoPoint): Boolean { selectPlace(Place("الموقع المحدد", p.latitude, p.longitude)); return true }
+        }))
         root.addView(map, FrameLayout.LayoutParams(-1, -1))
-
-        // ---------- طبقة الواجهة ----------
         val ui = FrameLayout(this)
         root.addView(ui, FrameLayout.LayoutParams(-1, -1))
         ViewCompat.setOnApplyWindowInsetsListener(ui) { v, insets ->
             val b = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(0, b.top, 0, b.bottom)
-            insets
+            v.setPadding(0, b.top, 0, b.bottom); insets
         }
-
-        // شريط البحث
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER_VERTICAL
-        bar.background = roundBg(Color.WHITE, 28)
-        bar.elevation = dp(8).toFloat()
-        bar.setPadding(dp(16), dp(4), dp(8), dp(4))
-        searchBox = EditText(this)
-        searchBox.hint = "ابحث عن مكان…"
-        searchBox.setSingleLine(true)
-        searchBox.background = null
-        searchBox.textSize = 16f
-        searchBox.inputType = InputType.TYPE_CLASS_TEXT
-        searchBox.imeOptions = EditorInfo.IME_ACTION_SEARCH
-        searchBox.setOnEditorActionListener { _, id, _ ->
-            if (id == EditorInfo.IME_ACTION_SEARCH) { doSearch(); true } else false
+        val top = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val searchBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            background = bg(); elevation = dp(6).toFloat()
+            setPadding(dp(14), dp(3), dp(6), dp(3))
         }
-        val searchBtn = TextView(this)
-        searchBtn.text = "🔍"
-        searchBtn.textSize = 22f
-        searchBtn.setPadding(dp(12), dp(8), dp(12), dp(8))
-        searchBtn.setOnClickListener { doSearch() }
-        bar.addView(searchBox, LinearLayout.LayoutParams(0, dp(48), 1f))
-        bar.addView(searchBtn)
-        val blp = FrameLayout.LayoutParams(-1, -2, Gravity.TOP)
-        blp.setMargins(dp(12), dp(12), dp(12), 0)
-        ui.addView(bar, blp)
+        searchBox = EditText(this).apply {
+            hint = "وين تريد تروح؟"; setHintTextColor(muted); setTextColor(ink)
+            textSize = 16f; setSingleLine(true); background = null
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            setOnEditorActionListener { _, id, _ ->
+                if (id == EditorInfo.IME_ACTION_SEARCH) { searchOnline(); true } else false
+            }
+            setOnFocusChangeListener { _, focused -> if (focused && text.isEmpty()) showSavedPlaces() }
+        }
+        searchBar.addView(searchBox, LinearLayout.LayoutParams(0, dp(51), 1f))
+        searchBar.addView(text("⌕", 28f, true, teal).apply {
+            gravity = Gravity.CENTER; setPadding(dp(9), 0, dp(9), 0); setOnClickListener { searchOnline() }
+        })
+        top.addView(searchBar)
+        navBanner = text("", 17f, true, Color.WHITE).apply {
+            background = bg(teal, 18); setPadding(dp(18), dp(14), dp(18), dp(14))
+            visibility = View.GONE; setOnClickListener { announceCurrentTurn() }
+        }
+        top.addView(navBanner, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        ui.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { setMargins(dp(12), dp(12), dp(12), 0) })
 
-        // مقياس السرعة
-        speedView = TextView(this)
-        speedView.text = "0\nكم/س"
-        speedView.setTextColor(Color.WHITE)
-        speedView.textSize = 26f
-        speedView.typeface = Typeface.DEFAULT_BOLD
-        speedView.gravity = Gravity.CENTER
-        val sbg = GradientDrawable()
-        sbg.shape = GradientDrawable.OVAL
-        sbg.setColor(Color.parseColor("#CC1B2A41"))
-        sbg.setStroke(6, Color.parseColor("#2E86DE"))
-        speedView.background = sbg
-        val size = dp(110)
-        val slp = FrameLayout.LayoutParams(size, size, Gravity.BOTTOM or Gravity.START)
-        slp.setMargins(dp(16), 0, 0, dp(32))
-        ui.addView(speedView, slp)
+        val leftBottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+        limitView = text("الحد: غير متوفر", 12f, true).apply {
+            gravity = Gravity.CENTER; background = bg(); setPadding(dp(10), dp(8), dp(10), dp(8))
+        }
+        leftBottom.addView(limitView, LinearLayout.LayoutParams(-2, -2))
+        speedView = text("0\nكم/س", 24f, true, Color.WHITE).apply {
+            gravity = Gravity.CENTER; background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL; setColor(navy); setStroke(dp(3), teal)
+            }
+            contentDescription = "السرعة الحالية"
+        }
+        leftBottom.addView(speedView, LinearLayout.LayoutParams(dp(84), dp(84)).apply { topMargin = dp(7) })
+        ui.addView(leftBottom, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply { setMargins(dp(12), 0, 0, dp(158)) })
 
-        // زر موقعي الحالي
-        fab = TextView(this)
-        fab.text = "📍"
-        fab.textSize = 24f
-        fab.gravity = Gravity.CENTER
-        fab.background = ovalBg(Color.WHITE)
-        fab.elevation = dp(8).toFloat()
-        fab.setOnClickListener { goToMyLocation() }
-        val flp = FrameLayout.LayoutParams(dp(56), dp(56), Gravity.BOTTOM or Gravity.END)
-        flp.setMargins(0, 0, dp(16), dp(32))
-        ui.addView(fab, flp)
+        val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        locationButton = iconButton("◎") { goToMyLocation() }
+        right.addView(locationButton, LinearLayout.LayoutParams(dp(50), dp(50)))
+        themeButton = iconButton(if (dark) "☀" else "☾") { changeTheme() }
+        right.addView(themeButton, LinearLayout.LayoutParams(dp(50), dp(50)).apply { topMargin = dp(10) })
+        right.addView(iconButton("★") { showSavedPlaces() }, LinearLayout.LayoutParams(dp(50), dp(50)).apply { topMargin = dp(10) })
+        ui.addView(right, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { setMargins(0, 0, dp(12), dp(158)) })
 
-        // بطاقة تفاصيل المكان
-        card = LinearLayout(this)
-        card.orientation = LinearLayout.VERTICAL
-        card.background = roundBg(Color.WHITE, 20)
-        card.elevation = dp(12).toFloat()
-        card.setPadding(dp(16), dp(14), dp(16), dp(14))
-        card.visibility = View.GONE
-        val head = LinearLayout(this)
-        head.orientation = LinearLayout.HORIZONTAL
-        head.gravity = Gravity.CENTER_VERTICAL
-        titleView = TextView(this)
-        titleView.textSize = 18f
-        titleView.typeface = Typeface.DEFAULT_BOLD
-        titleView.setTextColor(Color.parseColor("#111111"))
-        val close = TextView(this)
-        close.text = "✕"
-        close.textSize = 20f
-        close.setTextColor(Color.parseColor("#555555"))
-        close.setPadding(dp(12), dp(4), dp(4), dp(4))
-        close.setOnClickListener { hideCard() }
-        head.addView(titleView, LinearLayout.LayoutParams(0, -2, 1f))
-        head.addView(close)
-        bodyView = TextView(this)
-        bodyView.textSize = 14f
-        bodyView.setTextColor(Color.parseColor("#333333"))
-        bodyView.setLineSpacing(0f, 1.2f)
-        val bodyLp = LinearLayout.LayoutParams(-1, -2)
-        bodyLp.topMargin = dp(8)
-        card.addView(head, LinearLayout.LayoutParams(-1, -2))
-        card.addView(bodyView, bodyLp)
-        val clp = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
-        clp.setMargins(dp(12), 0, dp(12), dp(12))
-        ui.addView(card, clp)
-
+        card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = bg(); elevation = dp(10).toFloat()
+            setPadding(dp(16), dp(13), dp(16), dp(14)); visibility = View.GONE
+        }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        cardTitle = text("الوجهة", 19f, true)
+        row.addView(cardTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(text("✕", 22f, true, muted).apply {
+            setPadding(dp(10), 0, dp(3), 0); setOnClickListener { closeCard() }
+        })
+        card.addView(row)
+        cardBody = text("", 14f, false, muted).apply { setPadding(0, dp(8), 0, dp(10)) }
+        card.addView(cardBody)
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        starButton = tappable("☆ حفظ") { saveSelected() }
+        buttons.addView(starButton, LinearLayout.LayoutParams(0, -2, 1f))
+        routeButton = tappable("عرض المسار") { if (navigating) stopNavigation() else if (route == null) calculateRoute(false) else beginNavigation() }
+        buttons.addView(routeButton, LinearLayout.LayoutParams(0, -2, 2f).apply { marginStart = dp(9) })
+        card.addView(buttons)
+        ui.addView(card, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(dp(12), 0, dp(12), dp(16)) })
         setContentView(root)
-
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (card.visibility == View.VISIBLE) {
-                    hideCard()
-                } else {
-                    isEnabled = false
-                    onBackPressedDispatcher.onBackPressed()
-                }
+                if (card.visibility == View.VISIBLE) closeCard() else { isEnabled = false; onBackPressedDispatcher.onBackPressed() }
             }
         })
-
-        if (hasLocationPermission()) startLocation() else askPermission()
+        if (hasLocation()) requestLocation() else ActivityCompat.requestPermissions(this,
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 1)
     }
 
-    // ---------- الصلاحيات والموقع ----------
-    private fun hasLocationPermission(): Boolean =
-        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-
-    private fun askPermission() {
-        ActivityCompat.requestPermissions(
-            this,
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
-            1
-        )
+    private fun applyMapTheme() {
+        // Contrast filter is a local visual transform of OSM's standard raster tiles, not a real dark tile style.
+        val filter = if (dark) ColorMatrixColorFilter(floatArrayOf(
+            -0.65f, 0f, 0f, 0f, 170f,
+            0f, -0.65f, 0f, 0f, 177f,
+            0f, 0f, -0.65f, 0f, 185f,
+            0f, 0f, 0f, 1f, 0f
+        )) else null
+        map.overlayManager.tilesOverlay.setColorFilter(filter)
+        map.invalidate()
     }
-
-    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
-        super.onRequestPermissionsResult(code, perms, res)
-        if (res.any { it == PackageManager.PERMISSION_GRANTED }) startLocation()
-        else toast("يحتاج التطبيق إلى إذن الموقع حتى يعمل")
+    private fun changeTheme() {
+        val options = arrayOf("تلقائي حسب إعداد الهاتف", "نهاري", "ليلي")
+        val codes = arrayOf("auto", "light", "dark")
+        AlertDialog.Builder(this).setTitle("مظهر دلّيني").setSingleChoiceItems(options,
+            codes.indexOf(prefs.getString("theme", "auto")).coerceAtLeast(0)) { dialog, which ->
+            prefs.edit().putString("theme", codes[which]).apply()
+            dialog.dismiss(); recreate()
+        }.setNegativeButton("إلغاء", null).show()
     }
-
+    private fun hasLocation() = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, results)
+        if (requestCode == 1 && results.any { it == PackageManager.PERMISSION_GRANTED }) requestLocation()
+        else toast("فعّلي صلاحية الموقع حتى يشتغل GPS")
+    }
     @SuppressLint("MissingPermission")
-    private fun startLocation() {
-        if (started) return
-        started = true
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        try { lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this) } catch (e: Exception) { }
-        try { lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 3000L, 5f, this) } catch (e: Exception) { }
-        var best: Location? = null
-        for (prov in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
-            try {
-                val l = lm.getLastKnownLocation(prov)
-                if (l != null && (best == null || l.time > best.time)) best = l
-            } catch (e: Exception) { }
+    private fun requestLocation() {
+        if (requestingLocation || !hasLocation()) return
+        requestingLocation = true
+        val manager = getSystemService(LOCATION_SERVICE) as LocationManager
+        try { manager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 1f, this) } catch (_: Exception) {}
+        try { manager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 3000L, 5f, this) } catch (_: Exception) {}
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            try { manager.getLastKnownLocation(provider)?.let { onLocationChanged(it) } } catch (_: Exception) {}
         }
-        if (best != null) onLocationChanged(best)
     }
-
     override fun onLocationChanged(location: Location) {
-        lastLoc = location
-        if (location.provider == LocationManager.GPS_PROVIDER) {
-            val kmh = if (location.hasSpeed()) (location.speed * 3.6f).roundToInt() else 0
-            speedView.text = "$kmh\nكم/س"
+        val previous = lastLocation
+        if (previous != null && location.time < previous.time - 5000L) return
+        lastLocation = location
+        val kmh = if (location.hasSpeed()) (location.speed * 3.6f).roundToInt() else 0
+        speedView.text = "$kmh\nكم/س"
+        val limit = currentLimit
+        speedView.setTextColor(if (limit != null && kmh > limit + 5) Color.rgb(255, 135, 104) else Color.WHITE)
+        if (limit != null && kmh > limit + 5 && System.currentTimeMillis() - lastSpeedWarning > 30000) {
+            lastSpeedWarning = System.currentTimeMillis(); speak("انتبه، تجاوزت حد السرعة")
         }
-        val p = GeoPoint(location.latitude, location.longitude)
-        if (firstFix) {
-            map.controller.setZoom(17.0)
-            map.controller.setCenter(p)
-            firstFix = false
-        } else if (follow) {
-            map.controller.animateTo(p)
-        }
+        val point = GeoPoint(location.latitude, location.longitude)
+        if (firstFix) { firstFix = false; map.controller.setZoom(17.0); map.controller.setCenter(point) }
+        else if (following) map.controller.animateTo(point)
         if (meMarker == null) {
-            val m = Marker(map)
-            m.title = "موقعك"
-            m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-            meMarker = m
-            map.overlays.add(m)
+            meMarker = Marker(map).apply { title = "موقعك"; setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER) }
+            meMarker?.let { map.overlays.add(it) }
         }
-        meMarker?.position = p
+        meMarker?.position = point
         map.invalidate()
-        val lq = lastQuery
-        if (lq == null || lq.distanceTo(location) > 500f) {
-            lastQuery = location
-            loadSigns(location.latitude, location.longitude)
+        if (lastSignsAt == null || lastSignsAt!!.distanceTo(location) > 600f) {
+            lastSignsAt = location; fetchSigns(location.latitude, location.longitude)
         }
+        if (navigating) updateNavigation(location)
     }
-
     private fun goToMyLocation() {
-        if (!hasLocationPermission()) { askPermission(); return }
-        startLocation()
-        val l = lastLoc
-        if (l == null) {
-            toast("جارٍ تحديد موقعك… تأكد من تشغيل الـ GPS")
+        if (!hasLocation()) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 1)
             return
         }
-        follow = true
-        map.controller.animateTo(GeoPoint(l.latitude, l.longitude), 17.0, 600L)
+        val l = lastLocation ?: run { toast("جاري تحديد الموقع، تأكدي من GPS"); return }
+        following = true; map.controller.animateTo(GeoPoint(l.latitude, l.longitude), 17.0, 550L)
     }
 
-    // ---------- البحث عن مكان ----------
-    private fun doSearch() {
-        val q = searchBox.text.toString().trim()
-        if (q.isEmpty()) return
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(searchBox.windowToken, 0)
-        val c = map.mapCenter
-        val lat = c.latitude
-        val lon = c.longitude
+    private fun readPlaces(key: String): MutableList<Place> = try {
+        val array = JSONArray(prefs.getString(key, "[]"))
+        (0 until array.length()).map { Place.fromJson(array.getJSONObject(it)) }.toMutableList()
+    } catch (_: Exception) { mutableListOf() }
+    private fun writePlaces(key: String, places: List<Place>) {
+        val a = JSONArray(); places.take(15).forEach { a.put(it.toJson()) }
+        prefs.edit().putString(key, a.toString()).apply()
+    }
+    private fun addRecent(place: Place) {
+        val list = readPlaces("recent")
+        list.removeAll { abs(it.lat - place.lat) < 0.00001 && abs(it.lon - place.lon) < 0.00001 }
+        list.add(0, place); writePlaces("recent", list)
+    }
+    private fun saveSelected() {
+        val place = selected ?: return
+        val labels = arrayOf("المفضلة ★", "البيت ⌂", "العمل ▣")
+        AlertDialog.Builder(this).setTitle("احفظ الموقع في").setItems(labels) { _, i ->
+            val key = when (i) { 1 -> "home"; 2 -> "work"; else -> "favorites" }
+            if (key == "favorites") {
+                val list = readPlaces(key)
+                list.removeAll { abs(it.lat - place.lat) < 0.00001 && abs(it.lon - place.lon) < 0.00001 }
+                list.add(0, place); writePlaces(key, list)
+            } else writePlaces(key, listOf(place))
+            toast("تم حفظ المكان على الجهاز")
+        }.show()
+    }
+    private fun showSavedPlaces() {
+        val items = mutableListOf<Pair<String, Place>>()
+        readPlaces("home").firstOrNull()?.let { items.add("⌂ البيت — ${it.name}" to it) }
+        readPlaces("work").firstOrNull()?.let { items.add("▣ العمل — ${it.name}" to it) }
+        readPlaces("favorites").forEach { items.add("★ ${it.name}" to it) }
+        readPlaces("recent").forEach { items.add("↺ ${it.name}" to it) }
+        if (items.isEmpty()) { toast("بعد ما حفظتي أي مكان. حددي موقعاً ثم اضغطي حفظ") ; return }
+        AlertDialog.Builder(this).setTitle("أماكني والمواقع الأخيرة")
+            .setItems(items.map { it.first }.toTypedArray()) { _, i -> selectPlace(items[i].second) }.show()
+    }
+    private fun searchOnline() {
+        val query = searchBox.text.toString().trim()
+        if (query.isEmpty()) { showSavedPlaces(); return }
+        hideKeyboard()
+        val id = ++searchRequest
+        toast("جاري البحث…")
         Thread {
             try {
-                val url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&accept-language=ar" +
-                    "&viewbox=${lon - 1},${lat + 1},${lon + 1},${lat - 1}&q=" + URLEncoder.encode(q, "UTF-8")
-                val arr = JSONArray(httpGet(url))
-                runOnUiThread { onSearchResults(arr) }
-            } catch (e: Exception) {
-                toast("تعذر البحث، تأكد من الاتصال بالإنترنت")
-            }
+                val c = map.mapCenter
+                val u = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=7&addressdetails=1&accept-language=ar" +
+                    "&viewbox=${c.longitude - 1},${c.latitude + 1},${c.longitude + 1},${c.latitude - 1}&q=" + URLEncoder.encode(query, "UTF-8")
+                val arr = JSONArray(httpGet(u))
+                val places = (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    Place(o.optString("name").ifBlank { o.optString("display_name").substringBefore(",") },
+                        o.getDouble("lat"), o.getDouble("lon"), o.optString("display_name"))
+                }
+                runOnUiThread {
+                    if (id != searchRequest) return@runOnUiThread
+                    if (places.isEmpty()) toast("ما لقينا نتائج لهذا البحث")
+                    else AlertDialog.Builder(this).setTitle("نتائج البحث")
+                        .setItems(places.map { it.name + "\n" + it.address.take(85) }.toTypedArray()) { _, i -> selectPlace(places[i]) }.show()
+                }
+            } catch (_: Exception) { toast("تعذر البحث. تحققي من الإنترنت") }
         }.start()
     }
-
-    private fun onSearchResults(arr: JSONArray) {
-        if (arr.length() == 0) { toast("لم يتم العثور على المكان"); return }
-        if (arr.length() == 1) { pickResult(arr.getJSONObject(0)); return }
-        val names = Array(arr.length()) { i -> shortName(arr.getJSONObject(i)) }
-        AlertDialog.Builder(this)
-            .setTitle("اختر المكان")
-            .setItems(names) { _, i -> pickResult(arr.getJSONObject(i)) }
-            .show()
-    }
-
-    private fun shortName(o: JSONObject): String {
-        val dn = o.optString("display_name")
-        val nm = o.optString("name")
-        return if (nm.isBlank()) dn else nm + "\n" + dn.substringAfter(",").trim()
-    }
-
-    private fun pickResult(o: JSONObject) {
-        val p = GeoPoint(o.getDouble("lat"), o.getDouble("lon"))
-        follow = false
-        map.controller.animateTo(p, 17.0, 800L)
-        selectPoint(p, o)
-    }
-
-    // ---------- تحديد نقطة وعرض تفاصيلها ----------
-    private fun selectPoint(p: GeoPoint, known: JSONObject?) {
-        placeMarker(p, "")
-        val id = ++reqId
-        if (known != null) {
-            showDetails(p, known)
-            return
+    private fun selectPlace(place: Place) {
+        if (navigating) stopNavigation()
+        selected = place; route = null; ++routeRequest
+        addRecent(place)
+        destinationMarker?.let { map.overlays.remove(it) }
+        destinationMarker = Marker(map).apply {
+            position = place.point(); title = place.name; icon = ContextCompat.getDrawable(this@MainActivity, R.drawable.ic_pin)
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
         }
-        titleView.text = "جارٍ جلب التفاصيل…"
-        bodyView.text = coordText(p)
-        showCard()
-        Thread {
-            try {
-                val url = "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&addressdetails=1&accept-language=ar" +
-                    "&lat=${p.latitude}&lon=${p.longitude}"
-                val o = JSONObject(httpGet(url))
-                runOnUiThread { if (id == reqId) showDetails(p, o) }
-            } catch (e: Exception) {
-                runOnUiThread { if (id == reqId) showDetails(p, JSONObject()) }
-                toast("تعذر جلب التفاصيل، تأكد من الاتصال بالإنترنت")
-            }
-        }.start()
-    }
-
-    private fun pick(addr: JSONObject?, vararg keys: String): String {
-        if (addr == null) return ""
-        for (k in keys) {
-            val v = addr.optString(k)
-            if (v.isNotBlank()) return v
-        }
-        return ""
-    }
-
-    private fun showDetails(p: GeoPoint, o: JSONObject) {
-        val addr = o.optJSONObject("address")
-        val display = o.optString("display_name")
-        var title = o.optString("name")
-        if (title.isBlank()) {
-            title = pick(addr, "road", "pedestrian", "suburb", "neighbourhood", "city_district", "city", "town", "village")
-        }
-        if (title.isBlank() && display.isNotBlank()) title = display.substringBefore(",")
-        if (title.isBlank()) title = "موقع غير مسمّى"
-
-        val sb = StringBuilder()
-        if (display.isNotBlank()) sb.append("📌 ").append(display).append("\n")
-        val kind = arabicType(o.optString("category"), o.optString("type"))
-        if (kind.isNotBlank()) sb.append("🏷️ النوع: ").append(kind).append("\n")
-        val area = pick(addr, "suburb", "neighbourhood", "city_district", "city", "town", "village")
-        val state = pick(addr, "state", "county")
-        if (area.isNotBlank() || state.isNotBlank()) {
-            sb.append("🏙️ المنطقة: ").append(listOf(area, state).filter { it.isNotBlank() }.joinToString("، ")).append("\n")
-        }
-        val me = lastLoc
-        if (me != null) {
-            val res = FloatArray(1)
-            Location.distanceBetween(me.latitude, me.longitude, p.latitude, p.longitude, res)
-            val m = res[0]
-            val dist = if (m < 1000f) "${m.roundToInt()} م" else String.format(Locale.US, "%.1f كم", m / 1000f)
-            sb.append("🧭 تبعد عنك: ").append(dist).append("\n")
-        }
-        sb.append("📍 ").append(coordText(p))
-
-        titleView.text = title
-        bodyView.text = sb.toString()
-        placeMarker(p, title)
-        showCard()
-    }
-
-    private fun coordText(p: GeoPoint): String =
-        String.format(Locale.US, "%.5f, %.5f", p.latitude, p.longitude)
-
-    private fun placeMarker(p: GeoPoint, title: String) {
-        selMarker?.let { map.overlays.remove(it) }
-        val m = Marker(map)
-        m.position = p
-        m.title = title
-        m.icon = ContextCompat.getDrawable(this, R.drawable.ic_pin)
-        m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-        m.setInfoWindow(null)
-        m.setOnMarkerClickListener { _, _ -> true }
-        selMarker = m
-        map.overlays.add(m)
-        map.invalidate()
-    }
-
-    private fun showCard() {
+        destinationMarker?.let { map.overlays.add(it) }
+        routeOverlay?.let { map.overlays.remove(it) }; routeOverlay = null
+        cardTitle.text = place.name
+        cardBody.text = place.address.ifEmpty { String.format(Locale.US, "%.5f, %.5f", place.lat, place.lon) }
+        routeButton.text = "عرض المسار"
+        starButton.text = "☆ حفظ"
         card.visibility = View.VISIBLE
-        card.post {
-            val shift = -(card.height + dp(12)).toFloat()
-            speedView.translationY = shift
-            fab.translationY = shift
-        }
-    }
-
-    private fun hideCard() {
-        card.visibility = View.GONE
-        speedView.translationY = 0f
-        fab.translationY = 0f
-        selMarker?.let { map.overlays.remove(it) }
-        selMarker = null
-        reqId++
+        following = false
+        map.controller.animateTo(place.point(), 16.5, 600L)
         map.invalidate()
     }
-
-    private fun arabicType(category: String, type: String): String {
-        val t = when (type) {
-            "restaurant" -> "مطعم"
-            "cafe" -> "مقهى"
-            "fast_food" -> "وجبات سريعة"
-            "hospital" -> "مستشفى"
-            "clinic" -> "عيادة"
-            "pharmacy" -> "صيدلية"
-            "school" -> "مدرسة"
-            "university" -> "جامعة"
-            "college" -> "كلية"
-            "kindergarten" -> "روضة"
-            "place_of_worship" -> "مكان عبادة"
-            "fuel" -> "محطة وقود"
-            "bank" -> "مصرف"
-            "atm" -> "صراف آلي"
-            "marketplace" -> "سوق"
-            "parking" -> "موقف سيارات"
-            "police" -> "مركز شرطة"
-            "hotel" -> "فندق"
-            "supermarket" -> "سوبرماركت"
-            "mall" -> "مجمع تجاري"
-            "bus_stop" -> "موقف حافلات"
-            "residential" -> "شارع سكني"
-            "primary", "secondary", "tertiary", "trunk", "motorway", "unclassified" -> "طريق"
-            "city" -> "مدينة"
-            "town" -> "بلدة"
-            "village" -> "قرية"
-            "suburb", "neighbourhood", "quarter" -> "حي"
-            "house", "apartments", "building" -> "مبنى"
-            "yes" -> "مبنى"
-            "" -> ""
-            else -> type.replace("_", " ")
+    private fun closeCard() {
+        if (navigating) stopNavigation()
+        card.visibility = View.GONE
+        destinationMarker?.let { map.overlays.remove(it) }; destinationMarker = null
+        routeOverlay?.let { map.overlays.remove(it) }; routeOverlay = null
+        route = null; selected = null; ++routeRequest
+        map.invalidate()
+    }
+    private fun formatDistance(m: Double) = if (m < 1000) "${m.roundToInt()} م" else String.format(Locale.US, "%.1f كم", m / 1000)
+    private fun calculateRoute(autoStart: Boolean) {
+        val dest = selected ?: return
+        val loc = lastLocation ?: run { toast("GPS لم يحدد موقعج بعد") ; return }
+        val id = ++routeRequest
+        routeButton.text = "جاري حساب الطريق…"
+        Thread {
+            try {
+                // Public OSRM demo instance: development testing only; no uptime or accuracy guarantees.
+                val url = "https://router.project-osrm.org/route/v1/driving/${loc.longitude},${loc.latitude};${dest.lon},${dest.lat}" +
+                    "?overview=full&geometries=geojson&steps=true"
+                val r = JSONObject(httpGet(url)).getJSONArray("routes").getJSONObject(0)
+                val coordinates = r.getJSONObject("geometry").getJSONArray("coordinates")
+                val pts = (0 until coordinates.length()).map { i ->
+                    val a = coordinates.getJSONArray(i); GeoPoint(a.getDouble(1), a.getDouble(0))
+                }
+                val steps = mutableListOf<Turn>()
+                val legs = r.getJSONArray("legs")
+                for (i in 0 until legs.length()) {
+                    val ss = legs.getJSONObject(i).getJSONArray("steps")
+                    for (j in 0 until ss.length()) {
+                        val s = ss.getJSONObject(j)
+                        val man = s.getJSONObject("maneuver")
+                        val a = man.getJSONArray("location")
+                        steps.add(Turn(GeoPoint(a.getDouble(1), a.getDouble(0)), instruction(man, s.optString("name")), s.optDouble("distance", 0.0)))
+                    }
+                }
+                val result = Route(pts, steps, r.getDouble("distance"), r.getDouble("duration"))
+                runOnUiThread {
+                    if (id != routeRequest) return@runOnUiThread
+                    route = result; showRoute(result)
+                    if (autoStart) { navigating = true; spokenStep = -1; nextVoiceStep = 0; routeButton.text = "إنهاء الملاحة"; updateNavigation(loc) }
+                }
+            } catch (_: Exception) {
+                runOnUiThread { if (id == routeRequest) { routeButton.text = if (navigating) "إنهاء الملاحة" else "عرض المسار"; toast("خدمة التوجيه غير متاحة أو تعذر حساب الطريق") } }
+            }
+        }.start()
+    }
+    private fun instruction(m: JSONObject, road: String): String {
+        val type = m.optString("type")
+        val modifier = m.optString("modifier")
+        val action = when {
+            type == "arrive" -> "وصلت إلى الوجهة"
+            type == "depart" -> "انطلق"
+            type == "roundabout" || type == "rotary" -> "ادخل الدوار"
+            modifier.contains("left") -> "انعطف يساراً"
+            modifier.contains("right") -> "انعطف يميناً"
+            modifier == "uturn" -> "التف للخلف عند السماح"
+            else -> "استمر للأمام"
         }
-        return if (t.isBlank() && category.isNotBlank()) category.replace("_", " ") else t
+        return if (road.isNotBlank() && type != "arrive") "$action نحو $road" else action
+    }
+    private fun showRoute(result: Route) {
+        routeOverlay?.let { map.overlays.remove(it) }
+        routeOverlay = Polyline().apply {
+            setPoints(result.points)
+            outlinePaint.color = teal; outlinePaint.strokeWidth = dp(7).toFloat()
+            outlinePaint.strokeCap = Paint.Cap.ROUND; outlinePaint.isAntiAlias = true
+        }
+        map.overlays.add(routeOverlay)
+        cardBody.text = "المسافة: ${formatDistance(result.meters)}  •  المدة: ${max(1, ceil(result.seconds / 60).toInt())} دقيقة\nتقدير تجريبي، تحقق من إشارات الطريق"
+        routeButton.text = if (navigating) "إنهاء الملاحة" else "ابدأ الملاحة"
+        if (result.points.size > 1) {
+            val n = result.points.map { it.latitude }.maxOrNull() ?: return
+            val s = result.points.map { it.latitude }.minOrNull() ?: return
+            val e = result.points.map { it.longitude }.maxOrNull() ?: return
+            val w = result.points.map { it.longitude }.minOrNull() ?: return
+            try { map.zoomToBoundingBox(BoundingBox(n, e, s, w), true, dp(65)) } catch (_: Exception) {}
+        }
+        map.invalidate()
+    }
+    private fun beginNavigation() {
+        if (route == null) { calculateRoute(true); return }
+        navigating = true; following = true; spokenStep = -1; nextVoiceStep = 0
+        routeButton.text = "إنهاء الملاحة"
+        lastLocation?.let { updateNavigation(it) }
+        toast("بدأ التوجيه التجريبي. لا تعتمدي عليه وحده أثناء القيادة")
+    }
+    private fun stopNavigation() {
+        navigating = false; ++routeRequest; navBanner.visibility = View.GONE
+        routeButton.text = if (route != null) "ابدأ الملاحة" else "عرض المسار"
+        tts?.stop()
+    }
+    private fun updateNavigation(loc: Location) {
+        val r = route ?: return
+        val dest = selected ?: return
+        val remainingStraight = distance(loc, dest.point())
+        if (remainingStraight < 35) {
+            speak("وصلت إلى الوجهة"); toast("وصلتِ إلى الوجهة"); stopNavigation(); return
+        }
+        if (r.points.isNotEmpty()) {
+            // Nearest route vertex: conservative approximation, not true road-map matching.
+            val offRoute = r.points.minOf { distance(loc, it) }
+            if (offRoute > 100 && System.currentTimeMillis() - lastReroute > 25000L) {
+                lastReroute = System.currentTimeMillis()
+                navBanner.text = "يتم إعادة حساب الطريق…"
+                calculateRoute(true)
+                return
+            }
+        }
+        if (r.turns.isEmpty()) { navBanner.text = "تابع المسار على الخريطة"; navBanner.visibility = View.VISIBLE; return }
+        while (nextVoiceStep < r.turns.size - 1 && distance(loc, r.turns[nextVoiceStep].point) < 25) nextVoiceStep++
+        // Advance to later maneuver when earlier point is passed and a later point is much closer.
+        if (nextVoiceStep < r.turns.size - 1 && distance(loc, r.turns[nextVoiceStep + 1].point) + 75 < distance(loc, r.turns[nextVoiceStep].point)) nextVoiceStep++
+        val step = r.turns[nextVoiceStep]
+        val meters = distance(loc, step.point)
+        navBanner.visibility = View.VISIBLE
+        navBanner.text = "${formatDistance(meters)}  •  ${step.instruction}"
+        if (meters < 220 && spokenStep != nextVoiceStep) {
+            spokenStep = nextVoiceStep
+            speak("بعد ${formatDistance(meters)}، ${step.instruction}")
+        }
+    }
+    private fun announceCurrentTurn() {
+        val r = route ?: return
+        r.turns.getOrNull(nextVoiceStep)?.let { speak(it.instruction) }
+    }
+    private fun distance(loc: Location, p: GeoPoint): Double {
+        val out = FloatArray(1)
+        Location.distanceBetween(loc.latitude, loc.longitude, p.latitude, p.longitude, out)
+        return out[0].toDouble()
+    }
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            ttsReady = tts?.setLanguage(Locale("ar")) != TextToSpeech.LANG_MISSING_DATA
+        }
+    }
+    private fun speak(message: String) {
+        if (ttsReady) tts?.speak(message, TextToSpeech.QUEUE_FLUSH, null, "dallini-${System.currentTimeMillis()}")
     }
 
-    // ---------- الإشارات والعلامات من OpenStreetMap ----------
-    private fun loadSigns(lat: Double, lon: Double) {
-        val d = 0.01
-        val bbox = "${lat - d},${lon - d},${lat + d},${lon + d}"
+    private fun fetchSigns(lat: Double, lon: Double) {
+        val id = ++signRequest
+        val d = 0.008
+        val bbox = "${lat-d},${lon-d},${lat+d},${lon+d}"
         val q = "[out:json][timeout:20];(" +
-            "node[\"highway\"~\"speed_camera|stop|give_way|traffic_signals|crossing\"]($bbox);" +
-            "node[\"traffic_sign\"]($bbox);" +
-            "node[\"traffic_calming\"]($bbox);" +
-            ");out body 300;"
+            "node[\"highway\"~\"stop|give_way|traffic_signals|crossing|speed_camera\"]($bbox);" +
+            "node[\"traffic_sign\"]($bbox);node[\"traffic_calming\"]($bbox);" +
+            "way[\"highway\"][\"maxspeed\"]($bbox););out center 180;"
         Thread {
             try {
                 val url = "https://overpass-api.de/api/interpreter?data=" + URLEncoder.encode(q, "UTF-8")
-                val json = JSONObject(httpGet(url))
-                val els = json.getJSONArray("elements")
-                runOnUiThread {
-                    map.overlays.removeAll(signMarkers.toSet())
-                    signMarkers.clear()
-                    for (i in 0 until els.length()) {
-                        val e = els.getJSONObject(i)
-                        val tags = e.optJSONObject("tags") ?: continue
-                        val m = Marker(map)
-                        m.position = GeoPoint(e.getDouble("lat"), e.getDouble("lon"))
-                        m.title = label(tags)
-                        m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                        signMarkers.add(m)
-                        map.overlays.add(m)
+                val data = JSONObject(httpGet(url)).getJSONArray("elements")
+                val found = mutableListOf<Pair<GeoPoint, String>>()
+                var bestLimit: Int? = null
+                var bestLimitDistance = 35.0
+                val current = lastLocation
+                for (i in 0 until data.length()) {
+                    val e = data.getJSONObject(i)
+                    val tags = e.optJSONObject("tags") ?: continue
+                    val center = e.optJSONObject("center") ?: e
+                    if (!center.has("lat") || !center.has("lon")) continue
+                    val p = GeoPoint(center.getDouble("lat"), center.getDouble("lon"))
+                    if (e.optString("type") == "way") {
+                        // The way's center is NOT an accurate speed limit match; do not display it as a legal limit.
+                        continue
                     }
+                    val label = signLabel(tags)
+                    if (label != null) found.add(p to label)
+                    // Speed limits require proper way geometry matching, intentionally unavailable in this MVP.
+                }
+                runOnUiThread {
+                    if (id != signRequest) return@runOnUiThread
+                    map.overlays.removeAll(signMarkers.toSet()); signMarkers.clear()
+                    found.take(55).forEach { (p, label) ->
+                        val m = Marker(map).apply {
+                            position = p; title = label
+                            icon = signDrawable(label); setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        }
+                        signMarkers.add(m); map.overlays.add(m)
+                    }
+                    currentLimit = bestLimit
+                    limitView.text = if (bestLimit == null) "الحد: غير متوفر" else "الحد: $bestLimit"
                     map.invalidate()
                 }
-            } catch (e: Exception) {
-                lastQuery = null
-            }
+            } catch (_: Exception) { /* Overpass public service is best-effort. */ }
         }.start()
     }
-
-    private fun label(t: JSONObject): String {
-        return when {
-            t.optString("highway") == "speed_camera" -> "📷 كاميرا سرعة"
-            t.optString("highway") == "stop" -> "🛑 قف"
-            t.optString("highway") == "give_way" -> "⚠️ أعطِ الأولوية"
-            t.optString("highway") == "traffic_signals" -> "🚦 إشارة ضوئية"
-            t.optString("highway") == "crossing" -> "🚶 عبور مشاة"
-            t.has("traffic_calming") -> "🚧 مطب / تهدئة سرعة"
-            t.has("maxspeed") -> "حد السرعة " + t.optString("maxspeed")
-            else -> "علامة مرورية"
-        }
+    private fun signLabel(t: JSONObject): String? = when {
+        t.optString("highway") == "stop" -> "قف"
+        t.optString("highway") == "give_way" -> "أعطِ الأولوية"
+        t.optString("highway") == "traffic_signals" -> "إشارة مرور"
+        t.optString("highway") == "crossing" -> "عبور مشاة"
+        t.optString("highway") == "speed_camera" -> "كاميرا سرعة"
+        t.has("traffic_calming") -> "مطب"
+        t.has("traffic_sign") -> "علامة مرورية"
+        else -> null
     }
-
-    // ---------- أدوات ----------
-    private fun httpGet(url: String): String {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.setRequestProperty("User-Agent", "Dallini/0.3 (Android)")
-        c.setRequestProperty("Accept-Language", "ar")
-        c.connectTimeout = 15000
-        c.readTimeout = 25000
+    private fun signDrawable(label: String): android.graphics.drawable.Drawable {
+        val bmp = Bitmap.createBitmap(dp(34), dp(34), Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.color = when (label) { "قف" -> Color.rgb(204, 53, 58); "إشارة مرور" -> teal; else -> Color.rgb(238, 157, 40) }
+        canvas.drawCircle(dp(17).toFloat(), dp(17).toFloat(), dp(15).toFloat(), paint)
+        paint.color = Color.WHITE
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = dp(2).toFloat()
+        canvas.drawCircle(dp(17).toFloat(), dp(17).toFloat(), dp(14).toFloat(), paint)
+        paint.style = Paint.Style.FILL; paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textAlign = Paint.Align.CENTER; paint.textSize = dp(14).toFloat()
+        val symbol = when (label) { "قف" -> "قف"; "إشارة مرور" -> "●"; "عبور مشاة" -> "م"; "كاميرا سرعة" -> "ك"; "مطب" -> "!"; else -> "!" }
+        canvas.drawText(symbol, dp(17).toFloat(), dp(22).toFloat(), paint)
+        return android.graphics.drawable.BitmapDrawable(resources, bmp)
+    }
+    private fun httpGet(u: String): String {
+        val conn = URL(u).openConnection() as HttpURLConnection
+        conn.connectTimeout = 12000; conn.readTimeout = 22000
+        conn.setRequestProperty("User-Agent", "DalliniNavigation/0.3 (personal testing app)")
+        conn.setRequestProperty("Accept-Language", "ar")
         try {
-            return c.inputStream.bufferedReader().readText()
-        } finally {
-            c.disconnect()
-        }
+            if (conn.responseCode !in 200..299) throw IllegalStateException("HTTP ${conn.responseCode}")
+            return conn.inputStream.bufferedReader().use { it.readText() }
+        } finally { conn.disconnect() }
     }
-
-    private fun toast(s: String) {
-        runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
-    }
-
+    private fun toast(message: String) { runOnUiThread { Toast.makeText(this, message, Toast.LENGTH_SHORT).show() } }
     override fun onResume() { super.onResume(); map.onResume() }
     override fun onPause() { map.onPause(); super.onPause() }
     override fun onDestroy() {
-        try {
-            val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            lm.removeUpdates(this)
-        } catch (e: Exception) { }
-        map.onDetach()
+        ++searchRequest; ++routeRequest; ++signRequest
+        handler.removeCallbacksAndMessages(null)
+        try { (getSystemService(LOCATION_SERVICE) as LocationManager).removeUpdates(this) } catch (_: Exception) {}
+        tts?.stop(); tts?.shutdown(); map.onDetach()
         super.onDestroy()
     }
 }
